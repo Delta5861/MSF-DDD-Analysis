@@ -1,14 +1,16 @@
 Written by Gabriel Versace, 21-07-2021
 
 ```{r getPackages}
-library(dplyr)
-library(readxlsb)
-library(here)
-library(lubridate)
-library(stringr)
-library(ggplot2)
-library(cellranger)
-library(readxl)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+               dplyr,
+               here,
+               lubridate,
+               stringr,
+               ggplot2,
+               cellranger,
+               readxl
+)
 ```
 
 ```{r helper_funcs}
