@@ -1,0 +1,781 @@
+Written by Gabriel Versace, 21-07-2021
+
+```{r getPackages}
+library(dplyr)
+library(readxlsb)
+library(here)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(cellranger)
+library(readxl)
+```
+
+```{r helper_funcs}
+# Given a certain drug string from the consumption tool (eg "AMOXICILLIN 1g / CLAVULANIC acid 200mg, powder")
+# Extract the pertinent information - name and dosage.
+# Special handling was required for drugs with dosages listed in IU/MIU.
+
+analyseDrug <- function(drug) {
+  caps <- str_extract_all(drug, "[A-Z]{5,99}")
+  caps <- paste(unlist(caps), collapse=" ")
+  
+  nums <- as.numeric(unlist(str_extract_all(drug, "[[:digit:]]+\\.?[[:digit:]]*")))
+  unit <- str_extract(drug, paste0(nums[1], "[ ]?[mglMIU]+"))
+  unit <- str_extract(unit, "[mglMIU]+")
+  unit <- ifelse(unit=="g", 1, 0.001)
+  if (grepl("(?i)benzathine", caps)) {
+    unit <- nums[1] * 0.6   # convert from MIU to g
+  } else if (grepl("(?i)benzylpenicillin", caps)) {
+    unit <- nums[1] * 0.739
+  }
+  amount <- ifelse(grepl("./ml", drug), nums[1] * nums[2], nums[1]) 
+  amount <- amount * unit
+  return(c(caps, amount))
+}
+
+```
+
+```{r read_from_events.csv}
+# Given a folder containing the DHIS data for a specific country in CSV form (named events.csv)
+# Deduplicate the data with distinct(), then modify column names for consistency
+# Filter by age, and set the date columns to Date format rather than strings
+# Create a new column for how long the patient stayed, filter out excessively long cases
+# Filter by wards - only include those we are interested in
+# Finally, filter by the selected start and end dates.
+
+read_from_events <- function(event_path) {
+  df <- read.csv(paste0(event_path, "/events.csv"))
+
+  if (nrow(df) == 0) {
+    stop("events.csv has zero rows")
+  }
+
+  df[is.na(df)] <- 0
+
+  df <- df %>%
+    distinct() %>%
+    rename(age = Age..combined..in.years.,
+           date_of_admission = Date.of.admission,
+           date_of_exit = Date.of.exit,
+           primary_diagnosis = Diagnosis.at.exit...primary,
+           admission_ward = Admission.ward) %>%
+    mutate(age = ifelse(age > Age..years., age, Age..years.)) %>%
+    filter(!is.na(age), age > min_age) %>%
+    mutate(date_of_admission = as.Date(date_of_admission, format="%Y-%m-%d")) %>%
+    mutate(date_of_exit = as.Date(date_of_exit, format="%Y-%m-%d")) %>%
+    mutate(lengthOfStay = ifelse(
+      date_of_exit - date_of_admission > 0, date_of_exit - date_of_admission, min_LOS)) %>%
+    filter(lengthOfStay <= max_LOS) %>%
+    filter(start_date <= date_of_admission, end_date >= date_of_exit)
+    
+  
+  if(use_include_wards == T) {
+    df <- df %>% filter(admission_ward %in% include_wards)
+  }
+  
+  if(use_exclude_wards == T) {
+    df <- df %>% filter(!(admission_ward %in% exclude_wards))
+  }
+  
+  df <- df %>% select(age, date_of_admission, date_of_exit, primary_diagnosis, lengthOfStay) 
+
+  return(df)
+}
+```
+
+```{r read_from_old_IPD}
+# Given a folder containing any number of old .med files 
+# Read in the data from each file, filter by age, and add to a dataframe
+
+readIPD <- function(rootDir) {
+  dataset <- data.frame()
+  files_here <- list.files(rootDir)
+  
+  if (length(files_here) == 0) {
+    stop("No old IPD files found, make sure they are in the correct place")
+  }
+  
+  for (f in files_here) {
+    full_path <- paste(rootDir, f, sep="/")
+    txt <- readLines(full_path)
+    st_inx <- grep("CodeStop 4 MedData", txt)
+    ward_inx <-  grep("Ward admitted to - OPTIONAL|Salle d'hopital admis a - OPTIONNEL", 
+                      iconv(head(txt, 100),
+                        from = "UTF-8", to = "ASCII//TRANSLIT"))
+    wards <- txt[(ward_inx + 1) : (ward_inx + 1)]
+    
+    txt <- paste(txt[(st_inx+1):length(txt)])
+    df  <- read.csv(text = txt, header=F, sep='\t')
+    colnames(df) <- c("pat_num", 
+                      "age", 
+                      "sex", 
+                      "village", 
+                      "date_of_admission",
+                      "location_admitted_from", 
+                      "ward_admitted_to", 
+                      "primary_diagnosis_code", 
+                      "details_of_primary_diagnosis", 
+                      "date_of_exit", 
+                      "exit_code", 
+                      "time_between_admission_and_death", 
+                      "referred_to"
+    )
+    df <- df %>% 
+      mutate(ward_admitted_to = wards[ward_admitted_to]) 
+    
+    df <- type.convert(df, as.is=T)
+    df$date_of_admission <- as.Date.numeric(df$date_of_admission, origin="1899-12-30")
+    df$date_of_exit <- as.Date.numeric(df$date_of_exit, origin="1899-12-30")
+    df <- df %>% 
+      filter(!is.na(age), age > min_age) %>%
+      filter(date_of_admission > as.Date("2014-01-01"))
+    dataset <- rbind(dataset, df)
+  }
+  
+  if (nrow(dataset) == 0) {
+    stop("Old IPD data failed to process.")
+  }
+
+  if(use_include_wards == T) {
+    dataset <- dataset %>% filter(ward_admitted_to %in% include_wards)
+  }
+  
+  if(use_exclude_wards == T) {
+    dataset <- dataset %>% filter(!(ward_admitted_to  %in% exclude_wards))
+  }
+  
+  dataset <- dataset %>%
+    distinct() %>%
+    mutate(lengthOfStay = ifelse(
+      date_of_exit - date_of_admission > 0, date_of_exit - date_of_admission, min_LOS)) %>%
+    filter(lengthOfStay <= max_LOS) %>%
+  
+  # if the length of stay is greater than the time between admission and death, 
+  # then reduce it to be at most that time
+    mutate(lengthOfStay = ifelse(
+      (lengthOfStay <= time_between_admission_and_death) | is.na(time_between_admission_and_death),
+      lengthOfStay, time_between_admission_and_death)) %>%
+
+    
+    select(age, date_of_admission, date_of_exit, details_of_primary_diagnosis, lengthOfStay) %>%
+    rename(primary_diagnosis = details_of_primary_diagnosis) %>%
+    filter(start_date <= date_of_admission, end_date >= date_of_exit)
+
+  return(dataset)
+}
+
+```
+
+```{r combine_old_new_IPD_data}
+# Combines all data from a location, e.g. "Helmand". Optional filtering by diagnosis
+
+combine_old_new_data <- function(location) {
+  old_data_loc <- paste0(here(), "/IPD Data/", location, "_OLD/")
+  new_data_loc <- paste0(here(), "/IPD Data/", location, "_DHIS/")
+  old_data <- readIPD(old_data_loc)
+  new_data <- read_from_events(new_data_loc)
+  all_data <- rbind(new_data, old_data)
+  if (filter_by_diagnosis != "") {
+    all_data <- all_data %>% filter(grepl(filter_by_diagnosis, primary_diagnosis))
+  }
+  return(all_data)
+}
+```
+
+```{r gen_monthly_data}
+# Gets the combined data for a location, finds the start and end month
+# Then generates a dataframe containing the month and number of bed days
+
+gen_monthly_data <- function(location) {
+  all_data <- combine_old_new_data(location)
+  
+  earliest <- floor_date  (min(all_data$date_of_exit, na.rm=T), "month")
+  latest   <- ceiling_date(max(all_data$date_of_exit, na.rm=T), "month")
+  
+  mnths    <- seq(earliest, latest, by="month")
+  monthly_bed_days <- data.frame(matrix(ncol=2, nrow=length(mnths)))
+  colnames(monthly_bed_days) <- c("Month", "Num_Days")
+  monthly_bed_days$Month <- mnths
+  now <- earliest
+  inx <- 1
+  while (now < latest) {
+    end_mnth <- now %m+% months(1)
+    tmp <- all_data %>% 
+      filter(date_of_exit >= now, date_of_exit <= end_mnth)
+    monthly_bed_days$Num_Days[inx] <- sum(tmp$lengthOfStay, na.rm=T)
+    now <- end_mnth
+    inx <- inx + 1
+  }
+  return(monthly_bed_days)
+}
+
+```
+
+```{r parse_pharmacy_data_new_final}
+parse_pharmacy_data <- function(target_dir) {
+  
+  # Make a list of valid dates from the start and end date
+  valid_years <- seq(start_date, end_date, by='year')
+  valid_years <- as.character(valid_years, format='%Y')
+  
+  # Find all the consumption tools 
+  print(paste0("Reading from ", target_dir))
+  all_sheets <- list.files(target_dir, pattern = ".xlsx", full.names = T)
+  
+  if (length(all_sheets) == 0) {
+    if (length(list.files(target_dir, pattern = ".xlsb")) > 0) {
+      stop("Please save a copy of the consumption tools in .xlsx format for processing")
+    }
+    stop("No consumption tools found, make sure they are in the correct location")
+  }
+  
+  
+  # Get the list of drugs
+  ddds  <- read.table(paste0(here(),"/DDDs.txt"), header = T)
+  drugs <- ddds$Drug
+  
+  # Collapse the drug names into a usable regex
+  regexpression <- paste0(drugs, collapse="|")
+  regexpression <- gsub("/| \\+ ", "|", regexpression)
+  regexpression <- paste0("(?i).*", regexpression, ".*")
+  
+  # Create a master table here - everything will be appended to it
+  master_table <- data.frame(matrix(nrow = 0, ncol = 4))
+  names(master_table) <- c("Code", "Description", "Month", "DDDs")
+  
+  for (sheet in all_sheets) {
+    
+    # Skip sheets if they are outside our date range
+    sheet_years <- str_extract_all(sheet, "20[0-9]{2}")
+    sheet_years <- last(sheet_years)
+    if (!sheet_years %in% valid_years) {
+      print(paste0("Skipping ", sheet))
+      next
+    }
+    
+    print(paste0("Reading ", sheet))
+    # Find the codes for the drugs of interest on the current sheet 
+    
+    codes <- tryCatch( {
+        read_excel(sheet, range="Department!A9:B1000") 
+      },
+      error = function(e) {
+        print("Reading from DEPARTMENT instead of Department")
+        read_excel(sheet, range="DEPARTMENT!A9:B1000") 
+      }
+    )
+    
+    
+    
+    codes <- codes %>% filter(grepl(regexpression, Description))
+    
+    # Import the columns of data, then merge 
+    
+    lims1 <- cell_limits(ul = c(4, 16), lr = c(NA, 18), sheet = "Projectdata")
+    lims2 <- cell_limits(ul = c(4, 26), lr = c(NA, 26), sheet = "Projectdata")
+
+    c1 <- read_excel(sheet, range = lims1, col_types = "text")
+    c2 <- read_excel(sheet, range = lims2, col_types = "numeric")
+    df <- cbind(c1, c2)
+
+    if (broadcast_departments == T) {
+      deps <- unique(df$Department)
+      for (d in deps) {
+        print(paste0(d, " - ", nrow(filter(df, Department==d))))
+      }
+    }
+    
+
+    # Only select IPD data, then remove the Department column,
+    # Make the 'Month' column a Date
+    # Filter out everything not in the codes we found before
+    # Add a Description column too.
+    df_ipd <- df %>% 
+      filter(Department %in% include_deparments) %>%
+      filter(!grepl("^[0-9]{5}$", Month)) %>%
+      select(Code, Month, MND) %>%
+      mutate(Month = my(Month)) %>%
+      filter(Code %in% codes$Code) %>%
+      mutate(Description = NA, .after=Code)
+    
+    if (nrow(df_ipd) == 0) {
+      cat("No valid departments found! Valid include:\n", 
+          paste0(include_deparments, collapse = ", "),
+          "\n\nDepartments found include:\n",
+          paste0(unique(df$Department), collapse = ", "), "\n\n")
+      stop("No departments found")
+    }
+    
+    # Fill in the description column from the data we gathered earlier
+    for (i in 1:nrow(df_ipd)) {
+      df_ipd$Description[i] <- codes[grepl(df_ipd$Code[i], codes$Code),][2]
+    }
+ 
+    # Remove drugs based on the extended description
+    df_ipd <- df_ipd  %>% filter(!grepl("disp|susp|eye", Description))
+    
+    # Parse the description into "DRUGNAME AMOUNTg"
+    for (i in 1:nrow(df_ipd)) {
+      drug_info <- analyseDrug(df_ipd$Description[i])
+      df_ipd$Description[i] <- paste0(drug_info[1], " ", drug_info[2], "g")
+    }
+ 
+    # Make a new dataframe for the combined values across relevant departments
+    combined <- data.frame(matrix(nrow=0,ncol=4))
+    names(combined) <- names(df_ipd)
+    
+    now <- min(df_ipd$Month)
+    end <- max(df_ipd$Month)
+    current_drugs <- unique(df_ipd$Description)
+    
+    # For each drug, combine all values for one month and add to the new dataframe
+    while (now < end) {
+      for (d in current_drugs) {
+        segment       <- df_ipd %>% filter(Description == d, Month == now)
+        if (nrow(segment) == 0) next
+        total_monthly <- sum(segment$MND)
+        segment       <- distinct(segment, Description, Month, .keep_all = T)
+        segment$MND   <- total_monthly
+        
+        combined <- rbind(segment, combined)
+      }
+      now <- now %m+% months(1)
+    }
+    
+    df_ipd <- combined %>% rename(DDDs = MND)
+    
+    # Get the DDD for each drug from DDDs.txt that we imported earlier
+    # Convert the MND column (monthly usage) into the number of DDDs used monthly
+    for (i in 1:nrow(df_ipd)) {
+      drug <- substr(df_ipd$Description[i], 1, 8)
+      ddd  <- ddds[grepl(paste0("(?i)", drug), ddds$Drug), ][1,3]
+      amount <- df_ipd$Description[i] %>%
+        str_extract("[[:digit:].]+") %>%
+        as.numeric()
+      df_ipd$DDDs[i] <- df_ipd$DDDs[i] * amount/ddd
+
+    }
+    
+    master_table <- rbind(master_table, df_ipd)
+  }
+  # Deduplicate
+  master_table <- distinct(master_table)
+
+  drug <- distinct(master_table, Description)
+  now <- min(master_table$Month)
+  
+  # Here we use repetitive left joins to turn the data into a nicer table form
+  for (i in 1:nrow(distinct(master_table, Month))) {
+    cons <- master_table %>% filter(Month == now) %>% select(Description, DDDs)
+    drug <- left_join(drug, cons, by='Description')
+    n <- names(drug)
+    n[length(n)] <- as.character.Date(now, format="%b.%Y") %>% toupper()
+    names(drug) <- n
+    drug <- distinct(drug)
+    now <- now %m+% months(1)
+  }
+  drug[is.na(drug)] <- 0
+  
+  # Here we add in the totals as a new column, and sort based on that
+  totals <- data.frame(rowSums(drug[,-1], na.rm = F))
+  drug <- drug %>% mutate(Totals = totals, .after=Description) 
+  sorted <- drug[order(drug$Totals, decreasing = T, as.character(drug$Description)),]
+
+  return(sorted)
+}
+```
+
+```{r process_pharmacy}
+# Given a location (e.g. "Helmand"), read in all the pharmacy data
+# Then add on a totals column for sorting
+# Next, merge together the Amoxicillin entries (e.g. 0.25g, 0.5g, 1g)
+# Finally, sort the data by the totals column
+
+process_pharmacy <- function(location) {
+  pharmacy_path <- paste0(here(), "/Pharmacy Data/", location)
+  pharmacy_data <- parse_pharmacy_data(pharmacy_path)
+  # 
+  merge_amox <- pharmacy_data %>% filter(grepl("AMOXICILLIN[E]* [0-9]", Description))
+  if (nrow(merge_amox) != 0) {
+    merge_amox[1,-1] <- colSums(merge_amox[,-1], na.rm = T)
+    merge_amox[1,1] <- "AMOXICILLIN"
+  
+    pharmacy_data <- bind_rows(merge_amox[1,], pharmacy_data) %>% filter(!grepl("AMOXICILLIN[E]* [0-9]", Description))
+  }
+  return(pharmacy_data)
+}
+
+```
+
+```{r ddds/1k bed days plot for specific drug}
+# Given a set of pharmacy data, monthly data, a drug and a location
+# Calculate only the months that are in both monthly_data and pharmacy_data
+# AND that are within the user's time bounds
+# Then, select only the specified drug from the pharmacy data
+# AND trim by the correct time period calculated previously
+# Then, filter the monthly data by the time period
+# Next, combine the drug data (from the pharmacy data) and the monthly data
+# Add a column for DDDs per 1000 bed days
+# Make sure all data has >= 0 days (otherwise DDDs per 1000 bed days is NaN)
+# Next, filter by interquartile range and mean, then plot the results.
+
+plot_by_drug <- function(pharmacy_data, monthly_data, drug, since = NA, location) {
+  mnths <- monthly_data %>% 
+    filter(!is.na(Num_Days)) %>%
+    select(Month)
+  mnths <- as.character.Date(mnths$Month, format="%b.%Y") %>% toupper()
+  mnths <- intersect(mnths, colnames(pharmacy_data))
+  user_mnths <- seq(start_date, end_date, by="month") %>% format(., format="%b.%Y") %>% toupper()
+  mnths <- intersect(mnths, user_mnths)
+  
+  if (length(mnths) == 0) {
+    stop(paste0("Invalid time period selected (", start_date, " to ", end_date, ")"))
+  }
+  
+  if (!is.na(since)) {
+    nm <- length(mnths)
+    mnths <- mnths[(nm-since):nm]
+  }
+  
+  filtered <- pharmacy_data %>% filter(Description == drug)
+  
+  if (nrow(filtered) == 0) {
+    stop(paste("Invalid drug:", drug))
+  } else if (is.na(filtered$Totals) || filtered$Totals == 0) {
+    stop(paste("No consumption found for", drug))
+  } else if (nrow(filtered) > 1) {
+    drugs <- paste(rownames(filtered), collapse = ", ")
+    stop(paste("Multiple drugs found, please select one of:", drugs))
+  }
+  
+  filtered <- filtered[colnames(filtered) %in% mnths]   # trim data by date
+  
+  bed_days <- monthly_data %>% 
+    filter(between(Month, 
+                   as.Date(paste0("01.",first(mnths)), format="%d.%B.%Y"),
+                   as.Date(paste0("01.",last(mnths)), format="%d.%B.%Y")))
+  
+  combined <- t(filtered) %>% 
+    bind_cols(bed_days) %>%
+    rename(X = ...1) %>%
+    mutate(ddd_per_1k = X*1000/Num_Days)  %>%
+    filter(Num_Days > 0)
+  
+  # filter based on interquartile range and mean
+  iqmean <- 3*IQR(combined$ddd_per_1k, na.rm=T) + mean(combined$ddd_per_1k, na.rm=T)
+  iqr_filtered <- combined %>% filter(between(ddd_per_1k, 0, iqmean))
+
+  plt <- ggplot(iqr_filtered, aes(x=Month, y=ddd_per_1k)) + 
+    geom_point() + 
+    geom_smooth(span=0.2) +
+    geom_smooth(se=F, colour="red", size=0.5) +
+    ylab("DDDs/1k Bed Days") +
+    labs(title=paste(rownames(filtered), "DDDs/1k Bed Days,", location))
+    
+  if (ncol(combined) != ncol(iqr_filtered)) {
+    print(paste0("Removed ", ncol(combined) - ncol(iqr_filtered), " entries greater than ", iqmean))
+  }
+  return(plt)
+}
+
+```
+
+```{r ddds/1k bed days plot for top N drugs}
+# Very similar to the above function - takes data, and the number of drugs to view.
+# The user can specify a value for 'since' to only show the last x months, 
+# for instance, since=36 will show the last 3 years.
+
+plot_top_N <- function(pharmacy_data, monthly_data, location, since = NA, N = 5) {
+  mnths <- monthly_data %>% 
+    filter(!is.na(Num_Days)) %>%
+    select(Month)
+  mnths <- as.character.Date(mnths$Month, format="%b.%Y") %>% toupper()
+  mnths <- intersect(mnths, colnames(pharmacy_data))
+  user_mnths <- seq(start_date, end_date, by="month") %>% format(., format="%b.%Y") %>% toupper()
+  mnths <- intersect(mnths, user_mnths)
+  
+  if (length(mnths) == 0) {
+    stop(paste0("Invalid time period selected (", start_date, " to ", end_date, ")"))
+  }
+  
+  if (!is.na(since)) {
+    nm <- length(mnths)
+    mnths <- mnths[(nm-since):nm]
+  }
+  
+  
+  bed_days <- monthly_data %>% 
+    filter(between(Month, 
+                   as.Date(paste0("01.",first(mnths)), format="%d.%B.%Y"),
+                   as.Date(paste0("01.",last(mnths)), format="%d.%B.%Y")))
+  filtered <- pharmacy_data[colnames(pharmacy_data) %in% mnths]
+  rownames(filtered) <- pharmacy_data[,1]
+  filtered <- filtered[order(rowSums(filtered, na.rm=T), decreasing = T),]
+
+  l <- list()
+  for (i in 1:N) {
+    data_1 <- t(filtered[i,]) %>%
+      bind_cols(bed_days) %>%
+      rename(X = ...1) %>%
+      mutate(ddd_per_1k = ifelse(Num_Days == 0, 0, X*1000/Num_Days)) %>%
+      filter(Num_Days >= 0) %>%
+      mutate(Drug = rownames(filtered)[i])
+    
+      iqmean <- 3*IQR(data_1$ddd_per_1k, na.rm=T) + mean(data_1$ddd_per_1k, na.rm=T)
+      data_1$ddd_per_1k[data_1$ddd_per_1k > iqmean] <- NA
+      l <- append(l, list(data_1))
+      
+  }
+  all_data <- Reduce(rbind, l) %>%
+    mutate(Year = year(Month))
+  
+  plt <- ggplot(all_data, aes(x=Month, y=ddd_per_1k, col=Drug)) +
+    geom_smooth(span=0.175, se=F) +
+    geom_point() +
+    facet_grid(Drug~.) +
+    xlab("Year") + 
+    ylim(0, NA) +
+    labs(title=paste("Top", N, "drugs, by DDDs/1k Bed Days,", location))
+  
+  
+  return(plt)
+}
+
+```
+
+```{r yearly_total_ddds_per_1k}
+# Unused.
+yearly_ddds_1k  <- function(pharmacy_data, monthly_data) {
+  earliest_year <- year(first(monthly_data$Month))
+  last_year     <- year(last(monthly_data$Month))
+  year_res      <- list()
+  for (y in earliest_year:last_year) {
+    tmp_ddds <- pharmacy_data[,grepl(as.character(y), colnames(pharmacy_data))]
+    tmp_beds <- monthly_data %>% filter(year(Month) == y)
+    yearly_ddds <- sum(rowSums(tmp_ddds, na.rm = T))
+    yearly_beds <- sum(tmp_beds$Num_Days, na.rm = T)
+    yearly_ddd_per_1k <- 1000 * yearly_ddds / yearly_beds
+    year_res <- append(year_res, yearly_ddd_per_1k)
+  }
+  return(c(earliest_year, last_year, year_res))
+}
+
+```
+
+```{r get_quarterly_ddd_per_1k} 
+quarterly_ddds_1k <- function(pharmacy_data, monthly_data, since = NA) {
+  earliest_year <- year(first(monthly_data$Month))
+  last_year     <- year(last(monthly_data$Month))
+  year_res      <- list()
+  if (!is.na(since)) {
+    earliest_year <- max(earliest_year, year(now() %m-% months(since)))
+  }
+
+  Q1 <- "JAN|FEB|MAR"
+  Q2 <- "APR|MAY|JUN"
+  Q3 <- "JUL|AUG|SEP"
+  Q4 <- "OCT|NOV|DEC"
+  for (y in earliest_year:last_year) {
+    for (q in c(Q1,Q2,Q3,Q4)) {
+      tmp_ddds <- pharmacy_data[,grepl(as.character(y), colnames(pharmacy_data)) &
+                                 grepl(q, colnames(pharmacy_data))]
+      tmp_beds <- monthly_data %>% filter(year(Month) == y) %>%
+        filter(grepl(q, toupper(as.character(month(Month, label=T)))))
+      if (length(dim(tmp_ddds)) != 2) {
+        year_res <- append(year_res, 0)
+        next
+      }
+      quart_ddds <- sum(rowSums(tmp_ddds, na.rm = T))
+      quart_beds <- sum(tmp_beds$Num_Days, na.rm = T)
+      quart_ddd_per_1k <- 1000 * quart_ddds / quart_beds
+      year_res <- append(year_res, quart_ddd_per_1k)
+    }
+  }
+  return(c(earliest_year, last_year, year_res))
+}
+
+
+```
+
+```{r quarterly_accessWatchReserve_plots}
+quarterly_AWARE_plots <- function(pharmacy_data, monthly_data, since = NA, location, category="ALL") {
+  access_drugs  <- read.table(paste0(here(), "/DDDs.txt"), header = T) %>% filter(Group=="ACCESS group")
+  watch_drugs   <- read.table(paste0(here(), "/DDDs.txt"), header = T) %>% filter(Group=="WATCH group")
+  reserve_drugs <- read.table(paste0(here(), "/DDDs.txt"), header = T) %>% filter(Group=="RESERVE group")
+  
+  access_regex  <- paste0(access_drugs$Drug, collapse="|")
+  access_regex  <- gsub("/| \\+ ", "|", access_regex)
+  access_regex  <- paste0("(?i).*", access_regex, ".*")
+  
+  watch_regex   <- paste0(watch_drugs$Drug, collapse="|")
+  watch_regex   <- gsub("/| \\+ ", "|", watch_regex)
+  watch_regex   <- paste0("(?i).*", watch_regex, ".*")
+  
+  reserve_regex <- paste0(reserve_drugs$Drug, collapse="|")
+  reserve_regex <- gsub("/| \\+ ", "|", reserve_regex)
+  reserve_regex <- paste0("(?i).*", reserve_regex, ".*")
+  
+  pharmacy_access  <- pharmacy_data %>% filter(grepl(access_regex,  Description))
+  pharmacy_watch   <- pharmacy_data %>% filter(grepl(watch_regex,   Description))
+  pharmacy_reserve <- pharmacy_data %>% filter(grepl(reserve_regex, Description))
+  
+  pharmacy_quarterly_access  <- quarterly_ddds_1k(pharmacy_access,  monthly_data, since)
+  pharmacy_quarterly_watch   <- quarterly_ddds_1k(pharmacy_watch,   monthly_data, since)
+  pharmacy_quarterly_reserve <- quarterly_ddds_1k(pharmacy_reserve, monthly_data, since)
+  
+  start_mnth <- as.Date(paste0(pharmacy_quarterly_access[[1]], "-01-01"))
+  end_mnth   <- as.Date(paste0(pharmacy_quarterly_access[[2]], "-12-01"))
+  
+  start_mnth <- max(start_mnth, start_date)
+  end_mnth   <- min(end_mnth, end_date)
+  
+  if (!is.na(since)) {
+    start_mnth <- max(start_mnth, year(now() %m-% months(since)))
+  }
+  
+  quarters   <- seq(start_mnth, end_mnth, by="quarter")
+  
+  pharmacy_quarterly_access  <- data.frame(data.matrix(pharmacy_quarterly_access[-1:-2])) %>%
+    cbind(quarters) %>%
+    mutate(Group="ACCESS") %>%
+    rename(DDD_1k = 1)
+  
+  pharmacy_quarterly_watch   <- data.frame(data.matrix(pharmacy_quarterly_watch[-1:-2])) %>%
+    cbind(quarters) %>%
+    mutate(Group="WATCH") %>%
+    rename(DDD_1k = 1)
+  
+  pharmacy_quarterly_reserve <- data.frame(data.matrix(pharmacy_quarterly_reserve[-1:-2])) %>%
+    cbind(quarters) %>%
+    mutate(Group="RESERVE") %>%
+    rename(DDD_1k = 1)
+  
+  combined <- rbind(pharmacy_quarterly_access, pharmacy_quarterly_watch, pharmacy_quarterly_reserve)
+
+  if (category == "ALL") {
+    plt <- ggplot(combined, aes(x=quarters, y=DDD_1k)) +
+      geom_col(aes(fill = Group)) + 
+      labs(title=paste("Quarterly Defined Daily Doses per 1k Bed days,", location))
+  } else if (category == "ACCESS") {
+    plt <- ggplot(pharmacy_quarterly_access, aes(x=quarters, y=DDD_1k)) +
+      geom_col(aes(fill = Group)) + 
+      labs(title=paste("Quarterly Defined Daily Doses per 1k Bed days,", location))
+  } else if (category == "WATCH") {
+    plt <- ggplot(pharmacy_quarterly_watch, aes(x=quarters, y=DDD_1k)) +
+      geom_col(aes(fill = Group)) + 
+      labs(title=paste("Quarterly Defined Daily Doses per 1k Bed days,", location))
+  } else if (category == "RESERVE") {
+    plt <- ggplot(pharmacy_quarterly_reserve, aes(x=quarters, y=DDD_1k)) +
+      geom_col(aes(fill = Group)) + 
+      labs(title=paste("Quarterly Defined Daily Doses per 1k Bed days,", location))
+  } else {
+    print(paste0("Invalid category ", category, ", choose one of ACCESS, WATCH, RESERVE, ALL"))
+  }
+  return(plt)
+}
+
+```
+
+```{r MAIN CONTROL} 
+min_LOS <- 1                        # The minimum length of stay (0 to 1 days)
+max_LOS <- 60                       # Maximum number of days for a patient to stay at a hospital
+min_age <- 15                       # Minimum age of patients to include
+filter_by_diagnosis <- ""           # Whether or not to attempt to filter (partially works)
+
+use_include_wards <- FALSE          # Forces wards to be in 'include_wards'
+use_exclude_wards <- TRUE           # Forces wards to not be in 'exclude_wards' (recommended)
+broadcast_departments <- TRUE       # Whether to print all available departments per consumption tool
+
+
+# 'wards' refers to the DHIS2 data
+include_wards <- c("SURG", "MED", "ISO", "HIV", "ICU", "TB")
+exclude_wards <- c("NEO", "PAED", "ITFC", "PÃ©diatrie", "NÃ©onatologie", "Paediatrics ward")
+
+start_date <- as.Date("2015-01-01") # The date to start reading/processing from
+end_date   <- as.Date("2030-01-01") # The date to stop processing
+
+# Departments to include for pharmacy data consumption tools
+include_deparments <- c("Maternity IPD",
+                        "Surgical IPD",
+                        "Medical IPD",
+                        "IPD", "OT", "ER",
+                        "TB/HIV",
+                        "ADULT WARD",
+                        "Medical male/Isolation",
+                        "Others", "Other",
+                        "Maternity",
+                        "MATERNITY",
+                        "Medical female",
+                        "Medical",
+                        "Surgery male/DR/Physio",
+                        "Surgery female",
+                        "Surgery",
+                        "SURGERY",
+                        "VIH/TB", "VIH TB Hop", "TB VIH",
+                        "MÃ©decine interne",
+                        "Chirurgie",
+                        "CHIRURGIE",
+                        "MaternitÃ©",
+                        "Armoires",
+                        "CPN Mweso",
+                        "MPATI",
+                        "MATERNITÃ‰",
+                        "MED INTERNE",
+                        "SALLES OP",
+                        "SALLE D'URGENCE",
+                        "IPD Adult"
+                        )
+
+
+pharmacy_Kutupalong <- process_pharmacy("Kutupalong")
+monthly_Kutupalong <- gen_monthly_data("Kutupalong")
+
+# value 'since' is in months. Default NA (all). 'N' specifies the number of drugs to view. Default 5 
+# category can be one of "ALL", "ACCESS", "WATCH", "RESERVE" to plot a specific category. Default ALL
+
+top5_Ku <- plot_top_N(pharmacy_Kutupalong, monthly_Kutupalong, since=30, "Kutupalong", N=5)
+quart_Ku <- quarterly_AWARE_plots(pharmacy_Kutupalong, monthly_Kutupalong, since=36, "Kutupalong", category="ALL")
+
+
+pharmacy_Gambela <- process_pharmacy("Kule_Gambela")
+monthly_Gambela <- gen_monthly_data("Kule_Gambela")
+
+top5_Ga <- plot_top_N(pharmacy_Gambela, monthly_Gambela,  since=30, "Kule_Gambela")
+quart_Ga <- quarterly_AWARE_plots(pharmacy_Gambela, monthly_Gambela, since=36, "Kule_Gambela")
+
+
+pharmacy_Helmand <- process_pharmacy("Helmand")
+monthly_Helmand  <- gen_monthly_data("Helmand")
+
+top5_He  <- plot_top_N(pharmacy_Helmand, monthly_Helmand, "Helmand", since=30,  N=5)
+clox_He  <- plot_by_drug(pharmacy_Helmand, monthly_Helmand, "CLOXACILLIN 0.25g", since=30, "Helmand")
+quart_He <- quarterly_AWARE_plots(pharmacy_Helmand, monthly_Helmand, since=36, "Helmand", category="ACCESS")
+
+pharmacy_Bentiu <- process_pharmacy("Bentiu")
+monthly_Bentiu <- gen_monthly_data("Bentiu")
+
+top5_Be <- plot_top_N(pharmacy_Bentiu, monthly_Bentiu, "Bentiu", since=30, N=5)
+quart_Be <- quarterly_AWARE_plots(pharmacy_Bentiu, monthly_Bentiu, since=36, "Bentiu")
+# clox_Be <- plot_by_drug(pharmacy_Bentiu, monthly_Bentiu, "CLOXACILLIN 0.5", "Bentiu")
+
+
+
+pharmacy_Mweso <- process_pharmacy("Mweso")
+monthly_Mweso <- gen_monthly_data("Mweso")
+
+top5_Mw <- plot_top_N(pharmacy_Mweso, monthly_Mweso, since=30, "Mweso")
+quart_Mw <- quarterly_AWARE_plots(pharmacy_Mweso, monthly_Mweso, since=36, "Mweso")
+
+
+
+pharmacy_Baraka <- process_pharmacy("Baraka")
+monthly_Baraka <- gen_monthly_data("Baraka")
+
+top5_Ba <- plot_top_N(pharmacy_Baraka, monthly_Baraka, "Baraka", since=30, N=5)
+quart_Ba <- quarterly_AWARE_plots(pharmacy_Baraka, monthly_Baraka, since=36, "Baraka")
+
+
+
+
+```
