@@ -11,6 +11,7 @@ pacman::p_load(
                cellranger,
                readxl
 )
+
 ```
 
 ```{r helper_funcs}
@@ -21,9 +22,10 @@ pacman::p_load(
 analyseDrug <- function(drug) {
   caps <- str_extract_all(drug, "[A-Z]{5,99}")
   caps <- paste(unlist(caps), collapse=" ")
-  
+  caps <- translate(caps)
   nums <- as.numeric(unlist(str_extract_all(drug, "[[:digit:]]+\\.?[[:digit:]]*")))
   unit <- str_extract(drug, paste0(nums[1], "[ ]?[mglMIU]+"))
+  if (is.na(unit)) unit <- str_extract(drug, paste0(nums[2], "[ ]?[mglMIU]+"))
   unit <- str_extract(unit, "[mglMIU]+")
   unit <- ifelse(unit=="g", 1, 0.001)
   if (grepl("(?i)benzathine", caps)) {
@@ -32,8 +34,36 @@ analyseDrug <- function(drug) {
     unit <- nums[1] * 0.739
   }
   amount <- ifelse(grepl("./ml", drug), nums[1] * nums[2], nums[1]) 
+  amount <- ifelse(grepl("[0-9]%", drug), nums[1] / 100 * nums[2], amount)
   amount <- amount * unit
   return(c(caps, amount))
+}
+
+
+translate <- function(string) {
+  switch(string,
+         "AMOXICILLINE"                 = return("AMOXICILLIN"),
+         "AMOXICILLINE CLAVULANIQUE"    = return("AMOXICILLIN CLAVULANIC"),
+         "AMPICILLINE"                  = return("AMPICILLIN"),
+         "AZITHROMYCINE"                = return("AZITHROMYCIN"),
+         "BENZATHINE BENZYLPENICILLINE" = return("BENZATHINE BENZYLPENICILLIN"),
+         "BENZYLPENICILLINE"            = return("BENZYLPENICILLIN"),
+         "CEFALEXINE"                   = return("CEFALEXIN"),
+         "CEFAZOLINE"                   = return("CEFAZOLIN"),
+         "CIPROFLOXACINE"               = return("CIPROFLOXACIN"),
+         "CLARITHROMYCINE"              = return("CLARITHROMYCIN"),
+         "CLINDAMYCINE"                 = return("CLINDAMYCIN"),
+         "CLOXACILLINE"                 = return("CLOXACILLIN"),
+         "ERYTHROMYCINE"                = return("ERYTHROMYCIN"),
+         "GENTAMICINE"                  = return("GENTAMICIN"),
+         "LEVOFLOXACINE"                = return("LEVOFLOXACIN"),
+         "LINEZOLIDE"                   = return("LINEZOLID"),
+         "MOXIFLOXACINE"                = return("MOXIFLOXACIN"),
+         "PHENOXYMETHYLPENICILLINE"     = return("PHENOXYMETHYLPENICILLIN"),
+         "RIFAMPICINE"                  = return("RIFAMPICIN"),
+         "STREPTOMYCINE"                = return("STREPTOMYCIN")
+         )
+  return(string)
 }
 
 ```
@@ -314,8 +344,8 @@ parse_pharmacy_data <- function(target_dir) {
       df_ipd$Description[i] <- codes[grepl(df_ipd$Code[i], codes$Code),][2]
     }
  
-    # Remove drugs based on the extended description
-    df_ipd <- df_ipd  %>% filter(!grepl("disp|susp|eye", Description))
+    # Remove drugs based on the extended description (collyre == eye)
+    df_ipd <- df_ipd  %>% filter(!grepl("disp|susp|eye|collyre", Description))
     
     # Parse the description into "DRUGNAME AMOUNTg"
     for (i in 1:nrow(df_ipd)) {
@@ -391,20 +421,26 @@ parse_pharmacy_data <- function(target_dir) {
 ```{r process_pharmacy}
 # Given a location (e.g. "Helmand"), read in all the pharmacy data
 # Then add on a totals column for sorting
-# Next, merge together the Amoxicillin entries (e.g. 0.25g, 0.5g, 1g)
+# Next, merge together entries of each drug (e.g. 0.25g, 0.5g, 1g)
 # Finally, sort the data by the totals column
 
 process_pharmacy <- function(location) {
   pharmacy_path <- paste0(here(), "/Pharmacy Data/", location)
   pharmacy_data <- parse_pharmacy_data(pharmacy_path)
-  # 
-  merge_amox <- pharmacy_data %>% filter(grepl("AMOXICILLIN[E]* [0-9]", Description))
-  if (nrow(merge_amox) != 0) {
-    merge_amox[1,-1] <- colSums(merge_amox[,-1], na.rm = T)
-    merge_amox[1,1] <- "AMOXICILLIN"
   
-    pharmacy_data <- bind_rows(merge_amox[1,], pharmacy_data) %>% filter(!grepl("AMOXICILLIN[E]* [0-9]", Description))
+  all_drugs <- str_extract_all(pharmacy_data$Description, "[A-Z]+ [A-Z]*")
+  all_drugs <- trimws(all_drugs)
+
+  for (d in unique(all_drugs)) {
+    merge_drug <- pharmacy_data %>% filter(grepl(paste0("^", d, " [0-9]"), Description))
+    if (nrow(merge_drug) == 0) next
+    merge_drug[1,-1] <- colSums(merge_drug[,-1], na.rm = T)
+    merge_drug[1,1] <- d
+    
+    pharmacy_data <- bind_rows(pharmacy_data, merge_drug[1,]) %>% 
+      filter(!grepl(paste0("^", d, " [0-9]"), Description))
   }
+
   return(pharmacy_data)
 }
 
@@ -656,8 +692,11 @@ quarterly_AWARE_plots <- function(pharmacy_data, monthly_data, since = NA, locat
   combined <- rbind(pharmacy_quarterly_access, pharmacy_quarterly_watch, pharmacy_quarterly_reserve)
 
   if (category == "ALL") {
-    plt <- ggplot(combined, aes(x=quarters, y=DDD_1k)) +
-      geom_col(aes(fill = Group)) + 
+    plt <- ggplot(combined, aes(x=quarters, y=DDD_1k, fill = Group)) +
+      geom_col() +
+      scale_fill_manual(values = c("ACCESS" = "#03B900",
+                               "WATCH" = "#D3F200",
+                               "RESERVE" = "#FF0000")) +
       labs(title=paste("Quarterly Defined Daily Doses per 1k Bed days,", location))
   } else if (category == "ACCESS") {
     plt <- ggplot(pharmacy_quarterly_access, aes(x=quarters, y=DDD_1k)) +
@@ -687,7 +726,7 @@ filter_by_diagnosis <- ""           # Whether or not to attempt to filter (parti
 
 use_include_wards <- FALSE          # Forces wards to be in 'include_wards'
 use_exclude_wards <- TRUE           # Forces wards to not be in 'exclude_wards' (recommended)
-broadcast_departments <- TRUE       # Whether to print all available departments per consumption tool
+broadcast_departments <- T       # Whether to print all available departments per consumption tool
 
 
 # 'wards' refers to the DHIS2 data
@@ -701,7 +740,7 @@ end_date   <- as.Date("2030-01-01") # The date to stop processing
 include_deparments <- c("Maternity IPD",
                         "Surgical IPD",
                         "Medical IPD",
-                        "IPD", "OT", "ER",
+                        "IPD", "OT", # ER not included 
                         "TB/HIV",
                         "ADULT WARD",
                         "Medical male/Isolation",
@@ -725,8 +764,16 @@ include_deparments <- c("Maternity IPD",
                         "MATERNITÃ‰",
                         "MED INTERNE",
                         "SALLES OP",
-                        "SALLE D'URGENCE",
-                        "IPD Adult"
+                        #  "SALLE D'URGENCE", # excluded, as it is ER
+                        "IPD Adult",
+                        "Kule IPD", 
+                        "Kule Maternity", 
+                        "Kule TB",
+                        "Kule HIV/TB",
+                        "Maternité",
+                        "VIH TB Hop",
+                        "Médecine interne"
+                        
                         )
 
 
@@ -739,44 +786,44 @@ monthly_Kutupalong <- gen_monthly_data("Kutupalong")
 top5_Ku <- plot_top_N(pharmacy_Kutupalong, monthly_Kutupalong, since=30, "Kutupalong", N=5)
 quart_Ku <- quarterly_AWARE_plots(pharmacy_Kutupalong, monthly_Kutupalong, since=36, "Kutupalong", category="ALL")
 
-
-pharmacy_Gambela <- process_pharmacy("Kule_Gambela")
-monthly_Gambela <- gen_monthly_data("Kule_Gambela")
-
-top5_Ga <- plot_top_N(pharmacy_Gambela, monthly_Gambela,  since=30, "Kule_Gambela")
-quart_Ga <- quarterly_AWARE_plots(pharmacy_Gambela, monthly_Gambela, since=36, "Kule_Gambela")
-
-
-pharmacy_Helmand <- process_pharmacy("Helmand")
-monthly_Helmand  <- gen_monthly_data("Helmand")
-
-top5_He  <- plot_top_N(pharmacy_Helmand, monthly_Helmand, "Helmand", since=30,  N=5)
-clox_He  <- plot_by_drug(pharmacy_Helmand, monthly_Helmand, "CLOXACILLIN 0.25g", since=30, "Helmand")
-quart_He <- quarterly_AWARE_plots(pharmacy_Helmand, monthly_Helmand, since=36, "Helmand", category="ACCESS")
-
-pharmacy_Bentiu <- process_pharmacy("Bentiu")
-monthly_Bentiu <- gen_monthly_data("Bentiu")
-
-top5_Be <- plot_top_N(pharmacy_Bentiu, monthly_Bentiu, "Bentiu", since=30, N=5)
-quart_Be <- quarterly_AWARE_plots(pharmacy_Bentiu, monthly_Bentiu, since=36, "Bentiu")
-# clox_Be <- plot_by_drug(pharmacy_Bentiu, monthly_Bentiu, "CLOXACILLIN 0.5", "Bentiu")
-
-
-
-pharmacy_Mweso <- process_pharmacy("Mweso")
-monthly_Mweso <- gen_monthly_data("Mweso")
-
-top5_Mw <- plot_top_N(pharmacy_Mweso, monthly_Mweso, since=30, "Mweso")
-quart_Mw <- quarterly_AWARE_plots(pharmacy_Mweso, monthly_Mweso, since=36, "Mweso")
-
-
-
-pharmacy_Baraka <- process_pharmacy("Baraka")
-monthly_Baraka <- gen_monthly_data("Baraka")
-
-top5_Ba <- plot_top_N(pharmacy_Baraka, monthly_Baraka, "Baraka", since=30, N=5)
-quart_Ba <- quarterly_AWARE_plots(pharmacy_Baraka, monthly_Baraka, since=36, "Baraka")
-
+# 
+# pharmacy_Gambela <- process_pharmacy("Kule_Gambela")
+# monthly_Gambela <- gen_monthly_data("Kule_Gambela")
+# 
+# top5_Ga <- plot_top_N(pharmacy_Gambela, monthly_Gambela,  since=30, "Kule_Gambela")
+# quart_Ga <- quarterly_AWARE_plots(pharmacy_Gambela, monthly_Gambela, since=36, "Kule_Gambela")
+# 
+# 
+# pharmacy_Helmand <- process_pharmacy("Helmand")
+# monthly_Helmand  <- gen_monthly_data("Helmand")
+# 
+# top5_He  <- plot_top_N(pharmacy_Helmand, monthly_Helmand, "Helmand", since=30,  N=5)
+# clox_He  <- plot_by_drug(pharmacy_Helmand, monthly_Helmand, "CLOXACILLIN", since=30, "Helmand")
+# quart_He <- quarterly_AWARE_plots(pharmacy_Helmand, monthly_Helmand, since=36, "Helmand", category="ALL")
+# 
+# pharmacy_Bentiu <- process_pharmacy("Bentiu")
+# monthly_Bentiu <- gen_monthly_data("Bentiu")
+# 
+# top5_Be <- plot_top_N(pharmacy_Bentiu, monthly_Bentiu, "Bentiu", since=20, N=5)
+# quart_Be <- quarterly_AWARE_plots(pharmacy_Bentiu, monthly_Bentiu, since=30, "Bentiu")
+# # clox_Be <- plot_by_drug(pharmacy_Bentiu, monthly_Bentiu, "CLOXACILLIN 0.5", "Bentiu")
+# 
+# 
+# 
+# pharmacy_Mweso <- process_pharmacy("Mweso")
+# monthly_Mweso <- gen_monthly_data("Mweso")
+# 
+# top5_Mw <- plot_top_N(pharmacy_Mweso, monthly_Mweso, since=30, "Mweso")
+# quart_Mw <- quarterly_AWARE_plots(pharmacy_Mweso, monthly_Mweso, since=36, "Mweso")
+# 
+# 
+# 
+# pharmacy_Baraka <- process_pharmacy("Baraka")
+# monthly_Baraka <- gen_monthly_data("Baraka")
+# 
+# top5_Ba <- plot_top_N(pharmacy_Baraka, monthly_Baraka, "Baraka", since=30, N=5)
+# quart_Ba <- quarterly_AWARE_plots(pharmacy_Baraka, monthly_Baraka, since=36, "Baraka")
+# 
 
 
 
