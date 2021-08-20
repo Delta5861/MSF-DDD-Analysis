@@ -9,7 +9,8 @@ pacman::p_load(
                stringr,
                ggplot2,
                cellranger,
-               readxl
+               readxl,
+               imputeTS
 )
 
 ```
@@ -42,6 +43,7 @@ analyseDrug <- function(drug) {
 
 translate <- function(string) {
   switch(string,
+         "AMIKACINE"                    = return("AMIKACIN"),
          "AMOXICILLINE"                 = return("AMOXICILLIN"),
          "AMOXICILLINE CLAVULANIQUE"    = return("AMOXICILLIN CLAVULANIC"),
          "AMPICILLINE"                  = return("AMPICILLIN"),
@@ -70,11 +72,11 @@ translate <- function(string) {
 
 ```{r read_from_events.csv}
 # Given a folder containing the DHIS data for a specific country in CSV form (named events.csv)
-# Deduplicate the data with distinct(), then modify column names for consistency
+# Modify column names for consistency
 # Filter by age, and set the date columns to Date format rather than strings
 # Create a new column for how long the patient stayed, filter out excessively long cases
 # Filter by wards - only include those we are interested in
-# Finally, filter by the selected start and end dates.
+# Finally, filter by the selected start and end dates and deduplicate.
 
 read_from_events <- function(event_path) {
   df <- read.csv(paste0(event_path, "/events.csv"))
@@ -86,12 +88,12 @@ read_from_events <- function(event_path) {
   df[is.na(df)] <- 0
 
   df <- df %>%
-    distinct() %>%
     rename(age = Age..combined..in.years.,
            date_of_admission = Date.of.admission,
            date_of_exit = Date.of.exit,
            primary_diagnosis = Diagnosis.at.exit...primary,
            admission_ward = Admission.ward) %>%
+    mutate(age = as.numeric(age)) %>%
     mutate(age = ifelse(age > Age..years., age, Age..years.)) %>%
     filter(!is.na(age), age > min_age) %>%
     mutate(date_of_admission = as.Date(date_of_admission, format="%Y-%m-%d")) %>%
@@ -99,9 +101,10 @@ read_from_events <- function(event_path) {
     mutate(lengthOfStay = ifelse(
       date_of_exit - date_of_admission > 0, date_of_exit - date_of_admission, min_LOS)) %>%
     filter(lengthOfStay <= max_LOS) %>%
-    filter(start_date <= date_of_admission, end_date >= date_of_exit)
-    
-  
+    filter(start_date <= date_of_admission, end_date >= date_of_exit) %>%
+    distinct(date_of_admission, date_of_exit, Case.number, age, .keep_all = T)
+
+
   if(use_include_wards == T) {
     df <- df %>% filter(admission_ward %in% include_wards)
   }
@@ -154,14 +157,16 @@ readIPD <- function(rootDir) {
                       "referred_to"
     )
     df <- df %>% 
-      mutate(ward_admitted_to = wards[ward_admitted_to]) 
-    
+      mutate(ward_admitted_to = wards[ward_admitted_to]) %>%
+      mutate(age = as.numeric(age))
+
     df <- type.convert(df, as.is=T)
     df$date_of_admission <- as.Date.numeric(df$date_of_admission, origin="1899-12-30")
     df$date_of_exit <- as.Date.numeric(df$date_of_exit, origin="1899-12-30")
     df <- df %>% 
       filter(!is.na(age), age > min_age) %>%
       filter(date_of_admission > as.Date("2014-01-01"))
+    
     dataset <- rbind(dataset, df)
   }
   
@@ -178,7 +183,7 @@ readIPD <- function(rootDir) {
   }
   
   dataset <- dataset %>%
-    distinct() %>%
+    distinct(pat_num, age, date_of_admission, date_of_exit, .keep_all = T) %>%
     mutate(lengthOfStay = ifelse(
       date_of_exit - date_of_admission > 0, date_of_exit - date_of_admission, min_LOS)) %>%
     filter(lengthOfStay <= max_LOS) %>%
@@ -208,6 +213,7 @@ combine_old_new_data <- function(location) {
   old_data <- readIPD(old_data_loc)
   new_data <- read_from_events(new_data_loc)
   all_data <- rbind(new_data, old_data)
+  all_data <- distinct(all_data)
   if (filter_by_diagnosis != "") {
     all_data <- all_data %>% filter(grepl(filter_by_diagnosis, primary_diagnosis))
   }
@@ -246,11 +252,7 @@ gen_monthly_data <- function(location) {
 
 ```{r parse_pharmacy_data_new_final}
 parse_pharmacy_data <- function(target_dir) {
-  
-  # Make a list of valid dates from the start and end date
-  valid_years <- seq(start_date, end_date, by='year')
-  valid_years <- as.character(valid_years, format='%Y')
-  
+
   # Find all the consumption tools 
   print(paste0("Reading from ", target_dir))
   all_sheets <- list.files(target_dir, pattern = ".xlsx", full.names = T)
@@ -277,15 +279,7 @@ parse_pharmacy_data <- function(target_dir) {
   names(master_table) <- c("Code", "Description", "Month", "DDDs")
   
   for (sheet in all_sheets) {
-    
-    # Skip sheets if they are outside our date range
-    sheet_years <- str_extract_all(sheet, "20[0-9]{2}")
-    sheet_years <- last(sheet_years)
-    if (!sheet_years %in% valid_years) {
-      print(paste0("Skipping ", sheet))
-      next
-    }
-    
+
     print(paste0("Reading ", sheet))
     # Find the codes for the drugs of interest on the current sheet 
     
@@ -293,7 +287,7 @@ parse_pharmacy_data <- function(target_dir) {
         read_excel(sheet, range="Department!A9:B1000") 
       },
       error = function(e) {
-        print("Reading from DEPARTMENT instead of Department")
+        # print("Reading from DEPARTMENT instead of Department")
         read_excel(sheet, range="DEPARTMENT!A9:B1000") 
       }
     )
@@ -317,7 +311,6 @@ parse_pharmacy_data <- function(target_dir) {
         print(paste0(d, " - ", nrow(filter(df, Department==d))))
       }
     }
-    
 
     # Only select IPD data, then remove the Department column,
     # Make the 'Month' column a Date
@@ -329,7 +322,7 @@ parse_pharmacy_data <- function(target_dir) {
       select(Code, Month, MND) %>%
       mutate(Month = my(Month)) %>%
       filter(Code %in% codes$Code) %>%
-      mutate(Description = NA, .after=Code)
+      mutate(Description = NA, .after=Code) 
     
     if (nrow(df_ipd) == 0) {
       cat("No valid departments found! Valid include:\n", 
@@ -338,6 +331,9 @@ parse_pharmacy_data <- function(target_dir) {
           paste0(unique(df$Department), collapse = ", "), "\n\n")
       stop("No departments found")
     }
+    
+    df_ipd <- df_ipd %>% filter(between(Month, start_date, end_date))
+    if(nrow(df_ipd) == 0) next
     
     # Fill in the description column from the data we gathered earlier
     for (i in 1:nrow(df_ipd)) {
@@ -375,6 +371,9 @@ parse_pharmacy_data <- function(target_dir) {
       now <- now %m+% months(1)
     }
     
+        
+    if(nrow(combined) == 0) next
+ 
     df_ipd <- combined %>% rename(DDDs = MND)
     
     # Get the DDD for each drug from DDDs.txt that we imported earlier
@@ -410,10 +409,14 @@ parse_pharmacy_data <- function(target_dir) {
   drug[is.na(drug)] <- 0
   
   # Here we add in the totals as a new column, and sort based on that
-  totals <- data.frame(rowSums(drug[,-1], na.rm = F))
+  totals <- data.frame(rowSums(drug[,-1], na.rm = T))
   drug <- drug %>% mutate(Totals = totals, .after=Description) 
   sorted <- drug[order(drug$Totals, decreasing = T, as.character(drug$Description)),]
-
+  
+  if (drop_last_col) {
+    sorted <- sorted[-length(sorted)]
+  }
+  
   return(sorted)
 }
 ```
@@ -506,7 +509,8 @@ plot_by_drug <- function(pharmacy_data, monthly_data, drug, since = NA, location
 
   plt <- ggplot(iqr_filtered, aes(x=Month, y=ddd_per_1k)) + 
     geom_point() + 
-    geom_smooth(span=0.2) +
+    # geom_smooth(span=0.2, se=F) +
+    geom_line() + 
     geom_smooth(se=F, colour="red", size=0.5) +
     ylab("DDDs/1k Bed Days") +
     labs(title=paste(rownames(filtered), "DDDs/1k Bed Days,", location))
@@ -569,7 +573,8 @@ plot_top_N <- function(pharmacy_data, monthly_data, location, since = NA, N = 5)
     mutate(Year = year(Month))
   
   plt <- ggplot(all_data, aes(x=Month, y=ddd_per_1k, col=Drug)) +
-    geom_smooth(span=0.175, se=F) +
+    # geom_smooth(span=0.175, se=F) + # Disabled the drawing of a smooth line.
+    geom_line() + 
     geom_point() +
     facet_grid(Drug~.) +
     xlab("Year") + 
@@ -718,6 +723,49 @@ quarterly_AWARE_plots <- function(pharmacy_data, monthly_data, since = NA, locat
 
 ```
 
+```{r plot_seasonal_trends}
+seasonal_trends <- function(data_p, data_m, antibiotic, since = NA, by_DDD_1k = F) {
+
+  tmpdf <- data_p %>% filter(Description == antibiotic)
+  tmpdf <- tmpdf[-1:-2]
+  if (by_DDD_1k) {
+    mnths1 <- my(names(tmpdf))
+    mnths2 <- ymd(data_m$Month)
+    mnths <- intersect(mnths1, mnths2)
+    mnths <- as.Date(mnths, origin="1970-01-01")
+
+    if (!is.na(since)) {
+      nm <- length(mnths)
+      mnths <- mnths[(nm-since):nm]
+    }
+    
+    end_year <- year(last(mnths))
+    mnths <- interval(first(mnths), last(mnths))
+    
+    beddays <- data_m %>% filter(Month %within% mnths)
+    consump <- tmpdf[(my(names(tmpdf)) %within% mnths)]
+    tmpdf <- consump * 1000 / beddays$Num_Days
+    iqmean <- 3*IQR(tmpdf, na.rm=T) + mean(t(tmpdf), na.rm=T)
+    tmpdf[tmpdf > iqmean] <- NA
+  }
+  
+  if (nrow(tmpdf) == 0) {
+    print(paste0("Could not find consumption for ", antibiotic, ", options are:"))
+    for (d in data_p$Description) {
+      print(d)
+    }
+  } else {
+    tmpdf <- t(tmpdf)
+
+    tmp_ts <- ts(tmpdf[,1], end = end_year, frequency = 12)
+    modified <- na_seadec(tmp_ts)
+    returnValue(stl(modified, s.window = 7, robust=T))
+  }
+}
+
+
+```
+
 ```{r MAIN CONTROL} 
 min_LOS <- 1                        # The minimum length of stay (0 to 1 days)
 max_LOS <- 60                       # Maximum number of days for a patient to stay at a hospital
@@ -726,14 +774,14 @@ filter_by_diagnosis <- ""           # Whether or not to attempt to filter (parti
 
 use_include_wards <- FALSE          # Forces wards to be in 'include_wards'
 use_exclude_wards <- TRUE           # Forces wards to not be in 'exclude_wards' (recommended)
-broadcast_departments <- T       # Whether to print all available departments per consumption tool
-
+broadcast_departments <- FALSE      # Whether to print all available departments per consumption tool
+drop_last_col <- TRUE               # Whether to discard the last (usually incomplete) month of data
 
 # 'wards' refers to the DHIS2 data
 include_wards <- c("SURG", "MED", "ISO", "HIV", "ICU", "TB")
 exclude_wards <- c("NEO", "PAED", "ITFC", "PÃ©diatrie", "NÃ©onatologie", "Paediatrics ward")
 
-start_date <- as.Date("2015-01-01") # The date to start reading/processing from
+start_date <- as.Date("2018-01-01") # The date to start reading/processing from
 end_date   <- as.Date("2030-01-01") # The date to stop processing
 
 # Departments to include for pharmacy data consumption tools
@@ -777,54 +825,101 @@ include_deparments <- c("Maternity IPD",
                         )
 
 
+
 pharmacy_Kutupalong <- process_pharmacy("Kutupalong")
 monthly_Kutupalong <- gen_monthly_data("Kutupalong")
 
 # value 'since' is in months. Default NA (all). 'N' specifies the number of drugs to view. Default 5 
-# category can be one of "ALL", "ACCESS", "WATCH", "RESERVE" to plot a specific category. Default ALL
+# category can be one of "ALL", "ACCESS", "WATCH", "RESERVE" to plot a specific category. Default "ALL"
 
 top5_Ku <- plot_top_N(pharmacy_Kutupalong, monthly_Kutupalong, since=30, "Kutupalong", N=5)
 quart_Ku <- quarterly_AWARE_plots(pharmacy_Kutupalong, monthly_Kutupalong, since=36, "Kutupalong", category="ALL")
-
-# 
-# pharmacy_Gambela <- process_pharmacy("Kule_Gambela")
-# monthly_Gambela <- gen_monthly_data("Kule_Gambela")
-# 
-# top5_Ga <- plot_top_N(pharmacy_Gambela, monthly_Gambela,  since=30, "Kule_Gambela")
-# quart_Ga <- quarterly_AWARE_plots(pharmacy_Gambela, monthly_Gambela, since=36, "Kule_Gambela")
-# 
-# 
-# pharmacy_Helmand <- process_pharmacy("Helmand")
-# monthly_Helmand  <- gen_monthly_data("Helmand")
-# 
-# top5_He  <- plot_top_N(pharmacy_Helmand, monthly_Helmand, "Helmand", since=30,  N=5)
-# clox_He  <- plot_by_drug(pharmacy_Helmand, monthly_Helmand, "CLOXACILLIN", since=30, "Helmand")
-# quart_He <- quarterly_AWARE_plots(pharmacy_Helmand, monthly_Helmand, since=36, "Helmand", category="ALL")
-# 
-# pharmacy_Bentiu <- process_pharmacy("Bentiu")
-# monthly_Bentiu <- gen_monthly_data("Bentiu")
-# 
-# top5_Be <- plot_top_N(pharmacy_Bentiu, monthly_Bentiu, "Bentiu", since=20, N=5)
-# quart_Be <- quarterly_AWARE_plots(pharmacy_Bentiu, monthly_Bentiu, since=30, "Bentiu")
-# # clox_Be <- plot_by_drug(pharmacy_Bentiu, monthly_Bentiu, "CLOXACILLIN 0.5", "Bentiu")
-# 
-# 
-# 
-# pharmacy_Mweso <- process_pharmacy("Mweso")
-# monthly_Mweso <- gen_monthly_data("Mweso")
-# 
-# top5_Mw <- plot_top_N(pharmacy_Mweso, monthly_Mweso, since=30, "Mweso")
-# quart_Mw <- quarterly_AWARE_plots(pharmacy_Mweso, monthly_Mweso, since=36, "Mweso")
-# 
-# 
-# 
-# pharmacy_Baraka <- process_pharmacy("Baraka")
-# monthly_Baraka <- gen_monthly_data("Baraka")
-# 
-# top5_Ba <- plot_top_N(pharmacy_Baraka, monthly_Baraka, "Baraka", since=30, N=5)
-# quart_Ba <- quarterly_AWARE_plots(pharmacy_Baraka, monthly_Baraka, since=36, "Baraka")
-# 
+trends_Ku <- seasonal_trends(pharmacy_Kutupalong, monthly_Kutupalong, "AMOXICILLIN", by_DDD_1k = T, since = 30)
+plot(trends_Ku, col="blue", main=paste0("STL for Amoxicillin, Kutupalong (ddds/1k bed days)"))
 
 
+
+pharmacy_Gambela <- process_pharmacy("Kule_Gambela")
+monthly_Gambela <- gen_monthly_data("Kule_Gambela")
+
+top5_Ga <- plot_top_N(pharmacy_Gambela, monthly_Gambela,  since=30, "Kule_Gambela")
+quart_Ga <- quarterly_AWARE_plots(pharmacy_Gambela, monthly_Gambela, since=36, "Kule_Gambela")
+trends_Ga <- seasonal_trends(pharmacy_Gambela, monthly_Gambela, "AMOXICILLIN", by_DDD_1k = T, since = 30)
+plot(trends_Ga, col="blue", main=paste0("STL for Amoxicillin, Kule Gambela (ddds/1k bed days)"))
+
+
+
+pharmacy_Helmand <- process_pharmacy("Helmand")
+monthly_Helmand  <- gen_monthly_data("Helmand")
+
+top5_He <- plot_top_N(pharmacy_Helmand, monthly_Helmand, "Helmand", since=30,  N=5)
+clox_He <- plot_by_drug(pharmacy_Helmand, monthly_Helmand, "CLOXACILLIN", since=30, "Helmand")
+quart_He <- quarterly_AWARE_plots(pharmacy_Helmand, monthly_Helmand, since=36, "Helmand", category="ALL")
+# Note - since value for seasonal trends must be >= 25
+trends_He <- seasonal_trends(pharmacy_Helmand, monthly_Helmand, "AMOXICILLIN", by_DDD_1k = T, since = 30)
+plot(trends_He, col="blue", main=paste0("STL for Amoxicillin, Helmand (ddds/1k bed days)"))
+
+
+
+pharmacy_Bentiu <- process_pharmacy("Bentiu")
+monthly_Bentiu <- gen_monthly_data("Bentiu")
+
+top5_Be <- plot_top_N(pharmacy_Bentiu, monthly_Bentiu, "Bentiu", since=30, N=5)
+quart_Be <- quarterly_AWARE_plots(pharmacy_Bentiu, monthly_Bentiu, since=30, "Bentiu")
+clox_Be <- plot_by_drug(pharmacy_Bentiu, monthly_Bentiu, "BENZYLPENICILLIN", since=30, "Bentiu")
+trends_Be <- seasonal_trends(pharmacy_Bentiu, monthly_Bentiu, "AMOXICILLIN", by_DDD_1k = T, since = 30)
+plot(trends_Be, col="blue", main=paste0("STL for Amoxicillin, Bentiu (ddds/1k bed days)"))
+
+
+
+
+pharmacy_Mweso <- process_pharmacy("Mweso")
+monthly_Mweso <- gen_monthly_data("Mweso")
+
+top5_Mw <- plot_top_N(pharmacy_Mweso, monthly_Mweso, since=30, "Mweso")
+quart_Mw <- quarterly_AWARE_plots(pharmacy_Mweso, monthly_Mweso, since=36, "Mweso")
+trends_Mw <- seasonal_trends(pharmacy_Mweso, monthly_Mweso, "AMOXICILLIN", by_DDD_1k = T, since = 30)
+plot(trends_Mw, col="blue", main=paste0("STL for Amoxicillin, Mweso (ddds/1k bed days)"))
+
+
+
+
+pharmacy_Baraka <- process_pharmacy("Baraka")
+monthly_Baraka <- gen_monthly_data("Baraka")
+
+top5_Ba <- plot_top_N(pharmacy_Baraka, monthly_Baraka, "Baraka", since=30, N=5)
+quart_Ba <- quarterly_AWARE_plots(pharmacy_Baraka, monthly_Baraka, since=36, "Baraka")
+trends_Ba <- seasonal_trends(pharmacy_Baraka, monthly_Baraka, "AMOXICILLIN", by_DDD_1k = T, since = 30)
+plot(trends_Ba, col="blue", main=paste0("STL for Amoxicillin, Baraka (ddds/1k bed days)"))
+
+
+
+```
+``` {r auxilary funcs - }
+
+# Shows the total consumption, total bed days and DDDs/1k for the selected years for a given pharmacy/monthly dataset
+tc <- function(data_p, data_m) {
+  ys <- c("2018", "2019", "2020")
+  for (y in ys) {
+    s <- sum(data_p %>% select(contains(y)))
+    bd <- sum(data_m %>% filter(grepl(y, as.character(Month))) %>% select(Num_Days))
+    dd <- s * 1000 / bd
+    print(paste0(y, ": DDDs: ", s, ", Bed Days: ", bd, ", DDDs/1k Bed Days: ", dd))
+  }
+}
+
+# Shows the total usage of the selected antibiotics
+overall_usage <- function() {
+  d_ <- c("AMOXICILLIN", "CEFIXIME", "METRONIDAZOLE", "AMOXICILLIN CLAVULANIC", "CEFTRIAXONE", "CLOXACILLIN")
+  for (d in d_) {
+    t <-     sum(pharmacy_Baraka     %>% filter(Description == d) %>% select(Totals))
+    t <- t + sum(pharmacy_Bentiu     %>% filter(Description == d) %>% select(Totals))
+    t <- t + sum(pharmacy_Gambela    %>% filter(Description == d) %>% select(Totals))
+    t <- t + sum(pharmacy_Helmand    %>% filter(Description == d) %>% select(Totals))
+    t <- t + sum(pharmacy_Kutupalong %>% filter(Description == d) %>% select(Totals))
+    t <- t + sum(pharmacy_Mweso      %>% filter(Description == d) %>% select(Totals))
+    print(paste0(d, ": ", t))
+  }
+}
 
 ```
